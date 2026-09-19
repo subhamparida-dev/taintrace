@@ -191,10 +191,63 @@ class LockfileParser:
             deps.append(Dependency(name=name, version=resolved, ecosystem="node"))
         return deps
 
+    @staticmethod
+    def _find_cargo_workspace_root(path: Path) -> Optional[Path]:
+        """Find the nearest ancestor Cargo.toml declaring a workspace."""
+        start = path.parent if path.name.lower() == "cargo.toml" else path
+        for directory in (start, *start.parents):
+            candidate = directory / "Cargo.toml"
+            if not candidate.is_file():
+                continue
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+            if re.search(r"^\[workspace\]\s*$", content, flags=re.MULTILINE):
+                return candidate
+        return None
+
+    @staticmethod
+    def _parse_cargo_workspace_dependencies(path: Optional[Path]) -> dict[str, str]:
+        """Read versions from a Cargo workspace's [workspace.dependencies] section."""
+        if path is None:
+            return {}
+
+        content = path.read_text(encoding="utf-8", errors="replace")
+        section_match = re.search(
+            r"^\[workspace\.dependencies\]\s*$([\s\S]*?)(?=^\[|\Z)",
+            content,
+            flags=re.MULTILINE,
+        )
+        if not section_match:
+            return {}
+
+        versions: dict[str, str] = {}
+        for raw_line in section_match.group(1).splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+
+            dep_match = re.match(r'^([a-zA-Z0-9_-]+)\s*=\s*(.+?)\s*(?:#.*)?$', line)
+            if not dep_match:
+                continue
+
+            name, spec = dep_match.groups()
+            quoted_version = re.fullmatch(r'"([^"]+)"', spec)
+            if quoted_version:
+                versions[name] = quoted_version.group(1)
+                continue
+
+            version_match = re.search(r'version\s*=\s*"([^"]+)"', spec)
+            if version_match:
+                versions[name] = version_match.group(1)
+
+        return versions
+
     def _parse_cargo_toml(self, path: Path) -> List[Dependency]:
-        """Parse Cargo.toml for dependency names (in addition to Cargo.lock)."""
+        """Parse Cargo.toml dependency sections, including workspace-inherited versions."""
         deps = []
         content = path.read_text(encoding="utf-8", errors="replace")
+
+        workspace_root = self._find_cargo_workspace_root(path)
+        workspace_versions = self._parse_cargo_workspace_dependencies(workspace_root)
 
         sections = re.split(r"^\[(?:dev-|build-)?dependencies\]\s*$", content, flags=re.MULTILINE)
         for section in sections[1:]:
@@ -202,14 +255,23 @@ class LockfileParser:
                 line = line.strip()
                 if not line or line.startswith("#") or line.startswith("["):
                     break
+
                 name_match = re.match(r'^([a-zA-Z0-9_-]+)\s*=\s*', line)
-                if name_match:
-                    name = name_match.group(1)
+                if not name_match:
+                    continue
+
+                name = name_match.group(1)
+                workspace_inherited = re.search(r'\bworkspace\s*=\s*true\b', line) is not None
+
+                if workspace_inherited:
+                    version = workspace_versions.get(name, "workspace")
+                else:
                     ver_match = re.search(r'version\s*=\s*"([^"]+)"', line)
                     version = ver_match.group(1) if ver_match else "0.0.0"
-                    deps.append(Dependency(name=name, version=version, ecosystem="rust"))
-        return deps
 
+                deps.append(Dependency(name=name, version=version, ecosystem="rust"))
+
+        return deps
     def _parse_cargo(self, path: Path) -> List[Dependency]:
         """Parse Cargo.lock TOML format."""
         deps = []
